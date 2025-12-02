@@ -399,11 +399,13 @@ def main(args):
 
     if accelerator.is_main_process:
         tracker_config = vars(copy.deepcopy(args))
+        # Auto-generate wandb run name: {exp_name}-{optimizer}
+        wandb_run_name = f"{args.exp_name}-{args.optimizer}"
         accelerator.init_trackers(
             project_name="REPA", 
             config=tracker_config,
             init_kwargs={
-                "wandb": {"name": f"{args.exp_name}"}
+                "wandb": {"name": wandb_run_name}
             },
         )
         

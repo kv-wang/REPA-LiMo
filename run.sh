@@ -17,7 +17,7 @@ accelerate launch train.py \
   --proj-coeff=0.5 \
   --encoder-depth=8 \
   --output-dir="exps" \
-  --exp-name="linear-dinov2-b-enc8-fsdp-limo" \
+  --exp-name="linear-dinov2-b-enc8-fsdp" \
   --data-dir=[YOUR_DATA_PATH] \
   --use-fsdp \
   --fsdp-sharding-strategy="FULL_SHARD" \
