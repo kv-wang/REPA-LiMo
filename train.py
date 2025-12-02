@@ -17,10 +17,19 @@ from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate import FullyShardedDataParallelPlugin
+from torch.distributed.fsdp.fully_sharded_data_parallel import (
+    FullStateDictConfig, 
+    StateDictType,
+    BackwardPrefetch,
+    ShardingStrategy
+)
 
 from models.sit import SiT_models
 from loss import SILoss
 from utils import load_encoders
+from muon import Muon
+from limo import LiMo
 
 from dataset import CustomDataset
 from diffusers.models import AutoencoderKL
@@ -113,6 +122,28 @@ def requires_grad(model, flag=True):
         p.requires_grad = flag
 
 
+def get_muon_params(model):
+    """Get parameters that should use Muon/LiMO optimization (non-embedding/norm parameters)"""
+    muon_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        param_name = name.lower()
+        # 判断是否为 embedding/norm 参数
+        is_embln = any(
+            key in param_name
+            for key in [
+                "wte", "wpe", "embd", "embed", "bias",
+                "ln", "norm", "lm_head",
+                "output", "final_layer"
+            ]
+        )
+        # 非 embedding/norm 参数使用 Muon/LiMO 优化
+        if not is_embln:
+            muon_params.append(param)
+    return muon_params
+
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
@@ -124,14 +155,51 @@ def main(args):
         project_dir=args.output_dir, logging_dir=logging_dir
         )
 
+    # Configure FSDP if enabled
+    fsdp_plugin = None
+    if args.use_fsdp:
+        state_dict_config = FullStateDictConfig(
+            offload_to_cpu=args.fsdp_offload_to_cpu,
+            rank0_only=args.fsdp_state_dict_rank0_only
+        )
+        
+        # Convert string to enum for sharding_strategy
+        sharding_strategy_map = {
+            "FULL_SHARD": ShardingStrategy.FULL_SHARD,
+            "SHARD_GRAD_OP": ShardingStrategy.SHARD_GRAD_OP,
+            "NO_SHARD": ShardingStrategy.NO_SHARD,
+            "HYBRID_SHARD": ShardingStrategy.HYBRID_SHARD,
+        }
+        sharding_strategy = sharding_strategy_map.get(args.fsdp_sharding_strategy, ShardingStrategy.FULL_SHARD)
+        
+        # Convert string to enum for backward_prefetch
+        backward_prefetch_map = {
+            "BACKWARD_PRE": BackwardPrefetch.BACKWARD_PRE,
+            "BACKWARD_POST": BackwardPrefetch.BACKWARD_POST,
+            "NONE": None,
+        }
+        backward_prefetch = backward_prefetch_map.get(args.fsdp_backward_prefetch, BackwardPrefetch.BACKWARD_PRE)
+        
+        fsdp_plugin = FullyShardedDataParallelPlugin(
+            state_dict_config=state_dict_config,
+            sharding_strategy=sharding_strategy,
+            backward_prefetch=backward_prefetch,
+            mixed_precision_policy=None,  # Will use accelerator's mixed_precision
+        )
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
+        fsdp_plugin=fsdp_plugin,
     )
 
     if accelerator.is_main_process:
+        if args.use_fsdp:
+            logger.info(f"Using FSDP with sharding strategy: {args.fsdp_sharding_strategy}")
+        else:
+            logger.info("Using DDP (Distributed Data Parallel)")
         os.makedirs(args.output_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         save_dir = os.path.join(args.output_dir, args.exp_name)
         os.makedirs(save_dir, exist_ok=True)
@@ -201,13 +269,97 @@ def main(args):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )    
+    if args.optimizer.lower() == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
+        )
+    elif args.optimizer.lower() == "muon":
+        # Split parameters for MUON and AdamW
+        muon_params = get_muon_params(model)
+        all_trainable_params = set(p for p in model.parameters() if p.requires_grad)
+        muon_params_set = set(muon_params)
+        adamw_params = [p for p in all_trainable_params if p not in muon_params_set]
+        
+        param_groups = []
+        if muon_params:
+            param_groups.append({
+                "params": muon_params,
+                "use_muon": True,
+                "lr": args.learning_rate,
+                "momentum": args.momentum,
+                "weight_decay": args.adam_weight_decay,
+                "rms_scale": args.rms_scale,
+                "nesterov": args.nesterov,
+                "ns_steps": args.ns_steps,
+            })
+        if adamw_params:
+            param_groups.append({
+                "params": adamw_params,
+                "use_muon": False,
+                "lr": args.learning_rate,
+                "betas": (args.adam_beta1, args.adam_beta2),
+                "eps": args.adam_epsilon,
+                "weight_decay": args.adam_weight_decay,
+            })
+        
+        if not param_groups:
+            raise ValueError("No trainable parameters found!")
+        
+        optimizer = Muon(
+            param_groups,
+            defaults=dict(lr=args.learning_rate),
+            is_deepspeed_enabled=False,
+        )
+        if accelerator.is_main_process:
+            logger.info(f"Using MUON optimizer: {len(muon_params)} MUON params, {len(adamw_params)} AdamW params")
+    elif args.optimizer.lower() == "limo":
+        # Split parameters for LiMO and AdamW
+        limo_params = get_muon_params(model)  # Same function for LiMO
+        all_trainable_params = set(p for p in model.parameters() if p.requires_grad)
+        limo_params_set = set(limo_params)
+        adamw_params = [p for p in all_trainable_params if p not in limo_params_set]
+        
+        param_groups = []
+        if limo_params:
+            param_groups.append({
+                "params": limo_params,
+                "use_limo": True,
+                "lr": args.learning_rate,
+                "momentum": args.momentum,
+                "momentum_2": args.limo_momentum_2,
+                "weight_decay": args.adam_weight_decay,
+                "rms_scale": args.rms_scale,
+                "nesterov": args.nesterov,
+                "ns_steps": args.ns_steps,
+                "eps": args.limo_eps,
+                "use_scale": args.limo_use_scale,
+            })
+        if adamw_params:
+            param_groups.append({
+                "params": adamw_params,
+                "use_limo": False,
+                "lr": args.learning_rate,
+                "betas": (args.adam_beta1, args.adam_beta2),
+                "eps": args.adam_epsilon,
+                "weight_decay": args.adam_weight_decay,
+            })
+        
+        if not param_groups:
+            raise ValueError("No trainable parameters found!")
+        
+        optimizer = LiMo(
+            param_groups,
+            defaults=dict(lr=args.learning_rate),
+            is_deepspeed_enabled=False,
+        )
+        if accelerator.is_main_process:
+            logger.info(f"Using LiMO optimizer: {len(limo_params)} LiMO params, {len(adamw_params)} AdamW params")
+    else:
+        raise ValueError(f"Unknown optimizer: {args.optimizer}. Choose from 'adamw', 'muon', 'limo'")    
     
     # Setup data:
     train_dataset = CustomDataset(args.data_dir)
@@ -327,8 +479,21 @@ def main(args):
                 global_step += 1                
             if global_step % args.checkpointing_steps == 0 and global_step > 0:
                 if accelerator.is_main_process:
+                    # Handle FSDP state dict saving
+                    if args.use_fsdp:
+                        # For FSDP, we need to use unwrap_model and get_full_state_dict
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        with unwrapped_model.state_dict_type(
+                            StateDictType.FULL_STATE_DICT,
+                            state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+                        ):
+                            model_state_dict = unwrapped_model.state_dict()
+                    else:
+                        # For DDP, use module.state_dict()
+                        model_state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+                    
                     checkpoint = {
-                        "model": model.module.state_dict(),
+                        "model": model_state_dict,
                         "ema": ema.state_dict(),
                         "opt": optimizer.state_dict(),
                         "args": args,
@@ -409,6 +574,35 @@ def parse_args(input_args=None):
     # precision
     parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument("--mixed-precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
+
+    # optimizer
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon", "limo"],
+                        help="Optimizer type: adamw, muon, or limo")
+    # Common parameters for MUON and LiMO
+    parser.add_argument("--momentum", type=float, default=0.95, help="Momentum for MUON/LiMO optimizer")
+    parser.add_argument("--rms-scale", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use RMS scaling for MUON/LiMO")
+    parser.add_argument("--nesterov", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use Nesterov momentum for MUON/LiMO")
+    parser.add_argument("--ns-steps", type=int, default=5, help="Number of Newton-Schulz iterations for MUON/LiMO")
+    # LiMO-specific parameters
+    parser.add_argument("--limo-momentum-2", type=float, default=0.98, help="Second momentum for LiMO optimizer")
+    parser.add_argument("--limo-eps", type=float, default=1e-8, help="Epsilon for LiMO optimizer")
+    parser.add_argument("--limo-use-scale", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use scaling for LiMO optimizer")
+
+    # FSDP
+    parser.add_argument("--use-fsdp", action="store_true", help="Use Fully Sharded Data Parallel (FSDP)")
+    parser.add_argument("--fsdp-sharding-strategy", type=str, default="FULL_SHARD", 
+                        choices=["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD", "HYBRID_SHARD"],
+                        help="FSDP sharding strategy")
+    parser.add_argument("--fsdp-backward-prefetch", type=str, default="BACKWARD_PRE", 
+                        choices=["BACKWARD_PRE", "BACKWARD_POST", "NONE"],
+                        help="FSDP backward prefetch mode (NONE to disable)")
+    parser.add_argument("--fsdp-offload-to-cpu", action="store_true", 
+                        help="Offload FSDP state dict to CPU")
+    parser.add_argument("--fsdp-state-dict-rank0-only", action="store_true",
+                        help="Only rank 0 saves state dict in FSDP")
 
     # optimization
     parser.add_argument("--epochs", type=int, default=1400)
